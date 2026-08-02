@@ -73,7 +73,17 @@ func (w *SecurityProfileWatcher) Start(apiServerInformer configinformersv1.APISe
 func (w *SecurityProfileWatcher) handle(apiServer *configv1.APIServer) {
 	resolved, err := ResolveFromAPIServer(apiServer)
 	if err != nil {
-		klog.Errorf("TLS security profile watcher: failed to resolve APIServer TLS settings: %v", err)
+		// Bootstrap treats an identical resolve failure as fatal (see
+		// FetchAndResolve/GetTLSProfileSpec): keeping the operator running on a
+		// CR we can no longer parse would silently violate the "don't serve
+		// unknown TLS" intent. Escalate the same way here instead of only
+		// logging, so the operator restarts and re-runs the same fatal
+		// bootstrap check rather than running indefinitely on stale config.
+		klog.Errorf("TLS security profile watcher: failed to resolve APIServer TLS settings; "+
+			"triggering operator restart to re-run the same check at bootstrap: %v", err)
+		if w.OnChange != nil {
+			w.OnChange()
+		}
 		return
 	}
 

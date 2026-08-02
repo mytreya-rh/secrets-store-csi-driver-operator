@@ -10,14 +10,17 @@ import (
 	configclient "github.com/openshift/client-go/config/clientset/versioned"
 	libgoclient "github.com/openshift/library-go/pkg/config/client"
 	"github.com/openshift/library-go/pkg/controller/controllercmd"
+	"github.com/openshift/library-go/pkg/controller/fileobserver"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/serviceability"
 	"github.com/openshift/secrets-store-csi-driver-operator/pkg/operator"
 	sscsitls "github.com/openshift/secrets-store-csi-driver-operator/pkg/tls"
 	"github.com/openshift/secrets-store-csi-driver-operator/pkg/version"
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/component-base/cli"
 	"k8s.io/component-base/logs"
 	"k8s.io/klog/v2"
@@ -89,8 +92,12 @@ func newCommandWithTLSCustomization(cmdcfg *controllercmd.ControllerCommandConfi
 		if err != nil {
 			klog.Fatal(err)
 		}
+		terminateOnFiles, err := cmd.Flags().GetStringArray("terminate-on-files")
+		if err != nil {
+			klog.Fatal(err)
+		}
 
-		if err := startControllerWithTLSCustomization(ctx, cmdcfg, kubeConfigFile, namespace, bindAddress); err != nil {
+		if err := startControllerWithTLSCustomization(ctx, cmdcfg, kubeConfigFile, namespace, bindAddress, terminateOnFiles); err != nil {
 			klog.Fatal(err)
 		}
 	}
@@ -104,6 +111,7 @@ func startControllerWithTLSCustomization(
 	kubeConfigFile string,
 	namespace string,
 	bindAddress string,
+	terminateOnFiles []string,
 ) error {
 	unstructuredConfig, config, configContent, err := cmdcfg.Config()
 	if err != nil {
@@ -141,11 +149,40 @@ func startControllerWithTLSCustomization(
 		}
 	}()
 
+	// Mirrors the --terminate-on-files handling in the stock controllercmd
+	// Run closure (cmd.go), which we otherwise replace wholesale. Without this,
+	// any path passed via --terminate-on-files other than the serving-cert files
+	// already covered by WithRestartOnChange above would be silently ignored.
+	if len(terminateOnFiles) > 0 {
+		obs, err := fileobserver.NewObserver(10 * time.Second)
+		if err != nil {
+			return fmt.Errorf("failed to create --terminate-on-files observer: %w", err)
+		}
+		initialContent := map[string][]byte{}
+		for _, fn := range terminateOnFiles {
+			content, err := os.ReadFile(fn)
+			if err != nil {
+				klog.Warningf("Unable to read initial content of %q: %v", fn, err)
+				continue // intentionally ignore errors, same as upstream
+			}
+			initialContent[fn] = content
+		}
+		obs.AddReactor(func(filename string, action fileobserver.ActionType) error {
+			klog.Infof("exiting because %q changed", filename)
+			cancel()
+			return nil
+		}, initialContent, terminateOnFiles...)
+		go obs.Run(ctx.Done())
+	}
+
 	startFunc := func(ctx context.Context, controllerConfig *controllercmd.ControllerContext) error {
 		return operator.RunOperator(ctx, controllerConfig, resolvedTLS, cancel)
 	}
 
 	config.LeaderElection.Disable = cmdcfg.DisableLeaderElection
+	config.LeaderElection.LeaseDuration = cmdcfg.LeaseDuration
+	config.LeaderElection.RenewDeadline = cmdcfg.RenewDeadline
+	config.LeaderElection.RetryPeriod = cmdcfg.RetryPeriod
 
 	builder := controllercmd.NewController(componentName, startFunc, clock.RealClock{}).
 		WithKubeConfigFile(kubeConfigFile, nil).
@@ -155,6 +192,10 @@ func startControllerWithTLSCustomization(
 		WithEventRecorderOptions(events.RecommendedClusterSingletonCorrelatorOptions()).
 		WithRestartOnChange(exitOnChangeReactorCh, startingFileContent, observedFiles...).
 		WithComponentOwnerReference(cmdcfg.ComponentOwnerReference)
+
+	if cmdcfg.TopologyDetector != nil {
+		builder = builder.WithTopologyDetector(cmdcfg.TopologyDetector)
+	}
 
 	if !cmdcfg.DisableServing {
 		builder = builder.WithServer(config.ServingInfo, config.Authentication, config.Authorization)
@@ -187,7 +228,20 @@ func applyClusterTLSProfile(
 	fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	resolved, err := sscsitls.FetchAndResolve(fetchCtx, configClient.ConfigV1())
+	// Bounded retry with backoff: a single transient API-server hiccup at
+	// bootstrap should not crash-loop the operator pod. Genuinely persistent
+	// failures (RBAC, CRD missing, etc.) still surface as a fatal error once
+	// retries are exhausted, well within the 30s fetchCtx deadline above.
+	backoff := wait.Backoff{Duration: 2 * time.Second, Factor: 2, Steps: 3}
+	var resolved sscsitls.ResolvedProfile
+	err = retry.OnError(backoff, func(error) bool { return true }, func() error {
+		var fetchErr error
+		resolved, fetchErr = sscsitls.FetchAndResolve(fetchCtx, configClient.ConfigV1())
+		if fetchErr != nil {
+			klog.Warningf("failed to fetch cluster TLS profile, will retry: %v", fetchErr)
+		}
+		return fetchErr
+	})
 	if err != nil {
 		return sscsitls.ResolvedProfile{}, err
 	}

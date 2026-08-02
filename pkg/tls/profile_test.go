@@ -202,4 +202,19 @@ func TestApplyToServingInfo(t *testing.T) {
 	t.Run("nil servingInfo is a no-op", func(t *testing.T) {
 		ApplyToServingInfo(nil, ResolvedProfile{Honor: true, Spec: modern})
 	})
+
+	t.Run("all ciphers unsupported by Go falls back to empty CipherSuites without panicking", func(t *testing.T) {
+		serving := &configv1.HTTPServingInfo{}
+		ApplyToServingInfo(serving, ResolvedProfile{
+			Adherence: configv1.TLSAdherencePolicyStrictAllComponents,
+			Spec: configv1.TLSProfileSpec{
+				MinTLSVersion: configv1.VersionTLS12,
+				Ciphers:       []string{"NOT-A-REAL-CIPHER"},
+			},
+			Honor: true,
+		})
+		if len(serving.CipherSuites) != 0 {
+			t.Fatalf("CipherSuites = %#v, want empty (unsupported cipher dropped)", serving.CipherSuites)
+		}
+	})
 }

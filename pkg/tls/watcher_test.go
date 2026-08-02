@@ -69,6 +69,26 @@ func TestSecurityProfileWatcherHandle(t *testing.T) {
 			t.Fatalf("watcher should update seeded adherence, got %q", w.InitialTLSAdherencePolicy)
 		}
 	})
+
+	t.Run("unresolvable live config fires OnChange to escalate, consistent with bootstrap fail-hard policy", func(t *testing.T) {
+		var called atomic.Bool
+		w := &SecurityProfileWatcher{
+			InitialTLSProfileSpec:     intermediate,
+			InitialTLSAdherencePolicy: configv1.TLSAdherencePolicyStrictAllComponents,
+			OnChange:                  func() { called.Store(true) },
+		}
+		w.handle(&configv1.APIServer{
+			Spec: configv1.APIServerSpec{
+				TLSSecurityProfile: &configv1.TLSSecurityProfile{
+					Type:   configv1.TLSProfileCustomType,
+					Custom: nil, // triggers GetTLSProfileSpec's "Custom field is nil" error
+				},
+			},
+		})
+		if !called.Load() {
+			t.Fatal("OnChange should be called when the live APIServer TLS config can't be resolved, to restart and re-run the fatal bootstrap check")
+		}
+	})
 }
 
 func reflectDeepEqualProfile(a, b configv1.TLSProfileSpec) bool {

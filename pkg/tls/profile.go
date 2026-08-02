@@ -113,6 +113,16 @@ func ApplyToServingInfo(servingInfo *configv1.HTTPServingInfo, resolved Resolved
 
 	servingInfo.MinTLSVersion = string(resolved.Spec.MinTLSVersion)
 	servingInfo.CipherSuites = libgocrypto.OpenSSLToIANACipherSuites(resolved.Spec.Ciphers)
+	if len(resolved.Spec.Ciphers) > 0 && len(servingInfo.CipherSuites) == 0 {
+		// OpenSSLToIANACipherSuites silently drops (at klog V(4)) any cipher Go's
+		// crypto/tls cannot negotiate. If every configured cipher was dropped, the
+		// server falls back to Controllercmd's own default cipher suites, which
+		// may be broader than the cluster's TLS security profile intends. Surface
+		// this loudly instead of only via library-go's buried V(4) log.
+		klog.Warningf("all %d cipher(s) from the cluster TLS profile were unsupported by Go's crypto/tls "+
+			"and dropped; the metrics server will fall back to Controllercmd default ciphers instead of "+
+			"the cluster profile's %v", len(resolved.Spec.Ciphers), resolved.Spec.Ciphers)
+	}
 	klog.Infof("Applied cluster TLS profile to metrics serving config: minTLSVersion=%s, cipherSuites=%v",
 		servingInfo.MinTLSVersion, servingInfo.CipherSuites)
 }
