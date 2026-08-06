@@ -22,6 +22,7 @@ cmd/secrets-store-csi-driver-operator/main.go  -- Entry point; wires cobra comma
 pkg/operator/starter.go                        -- RunOperator: creates clients, informers, CSI controller set
 pkg/operator/starter_test.go                   -- Unit tests for operator sync state logic
 pkg/version/version.go                         -- Build version info via ldflags; registers Prometheus gauge
+pkg/tls/                                       -- Cluster TLS security profile resolution + live-change watcher
 pkg/dependencymagnet/dependencymagnet.go       -- Build-tag-guarded import to keep build-machinery-go vendored
 assets/                                        -- Embedded YAML manifests (go:embed)
   assets.go                                    -- embed.FS declaration and ReadFile wrapper
@@ -154,6 +155,7 @@ Container images in `assets/node.yaml` use variables like `${DRIVER_IMAGE}`, `${
 - `cmd/` -- One sub-package per binary. Contains only CLI wiring (cobra commands, controller config). No business logic.
 - `pkg/operator/` -- Operator startup and controller composition. This is where `RunOperator` lives.
 - `pkg/version/` -- Build version info. Injected via ldflags.
+- `pkg/tls/` -- Resolves the cluster TLS security profile and applies it to the operator's own HTTPS serving endpoint; see `docs/security-guidelines.md`.
 - `pkg/dependencymagnet/` -- Build-tag-guarded imports for tool dependencies.
 - `assets/` -- Embedded YAML manifests. The `assets.go` file provides the `ReadFile` API.
 

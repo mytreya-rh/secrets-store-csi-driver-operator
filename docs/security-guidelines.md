@@ -34,6 +34,12 @@
 - Prefer annotation-based auto-provisioning over hard-coding certificates or keys in manifests.
 - The operator mounts the CA bundle and serving cert into the operand as volumes — see `assets/node.yaml` for the volume/volumeMount pattern.
 
+## Cluster TLS Security Profile Adherence (operator's own HTTPS endpoint)
+
+- `pkg/tls` resolves the effective `MinTLSVersion`/`CipherSuites` from `apiserver.config.openshift.io/cluster` and, when `tlsAdherence` is `StrictAllComponents` or any unrecognized future value (fail-secure), applies them to the operator's own metrics/healthz `HTTPServingInfo`. Unset (empty) and `LegacyAdheringComponentsOnly` are *not* honored, leaving Controllercmd's own default TLS settings in place. This does not affect the CSI driver operand, which serves metrics over plain HTTP.
+- Resolution happens once at startup, before the HTTPS server starts (`cmd/secrets-store-csi-driver-operator/main.go`), and is retried with backoff since it depends on the API server and the pod's in-cluster credentials being available. A failure after retries is fatal — never silently serve an unverified TLS config.
+- `pkg/tls.SecurityProfileWatcher` re-resolves on every `APIServer` informer event and triggers a process restart (via the same restart path used for cert rotation and `--terminate-on-files`) if the live profile differs from what was applied at startup, since the HTTPS server has no in-place TLS reconfiguration.
+
 ## Image References
 
 - Container images use variable substitution (`${NODE_DRIVER_REGISTRAR_IMAGE}`, `${LIVENESS_PROBE_IMAGE}`, etc.) for deploy-time image injection.
