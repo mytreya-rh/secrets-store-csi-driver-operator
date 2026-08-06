@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	apiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/dynamic"
 	kubeclient "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -26,6 +28,7 @@ import (
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 	"github.com/openshift/secrets-store-csi-driver-operator/assets"
+	sscsitls "github.com/openshift/secrets-store-csi-driver-operator/pkg/tls"
 )
 
 const (
@@ -37,7 +40,16 @@ const (
 	resync             = 20 * time.Minute
 )
 
-func RunOperator(ctx context.Context, controllerConfig *controllercmd.ControllerContext) error {
+// RunOperator wires up and runs all operator controllers. resolvedTLS is the
+// cluster TLS security profile already applied to the operator's own
+// HTTPServingInfo at startup (see cmd/secrets-store-csi-driver-operator);
+// it's threaded through here only so the SecurityProfileWatcher below can
+// diff live changes against it.
+func RunOperator(
+	ctx context.Context,
+	controllerConfig *controllercmd.ControllerContext,
+	resolvedTLS sscsitls.ResolvedProfile,
+) error {
 	operatorNamespace := controllerConfig.OperatorNamespace
 
 	// Create core clientset and informers
@@ -132,6 +144,32 @@ func RunOperator(ctx context.Context, controllerConfig *controllercmd.Controller
 			providerName,
 		),
 	)
+
+	tlsWatcher := &sscsitls.SecurityProfileWatcher{
+		Initial: resolvedTLS,
+		OnChange: func() {
+			// The HTTPS server can't be reconfigured in place, so the
+			// process needs to restart. RequestShutdown emulates the same
+			// SIGTERM/SIGINT that controllercmd.StartController already
+			// wires up a graceful shutdown for (see cmd.go's
+			// server.SetupSignalHandler()), so this goes through the same
+			// context-cancellation chain as a real termination signal --
+			// controllers get to unwind, and the process exits 0 via the
+			// normal path -- instead of killing the process outright.
+			// RequestShutdown only fails (returns false) if that signal
+			// handler hasn't been installed yet, which can't happen here
+			// since this watcher only starts after it has been; os.Exit(0)
+			// is kept as a belt-and-suspenders fallback for that case.
+			klog.Info("Cluster TLS security profile changed, restarting to apply it")
+			if !apiserver.RequestShutdown() {
+				klog.Warning("failed to request a graceful shutdown, exiting directly")
+				os.Exit(0)
+			}
+		},
+	}
+	if err := tlsWatcher.Start(configInformers.Config().V1().APIServers()); err != nil {
+		return fmt.Errorf("failed to start cluster TLS security profile watcher: %w", err)
+	}
 
 	klog.Info("Starting the informers")
 	go kubeInformersForNamespaces.Start(ctx.Done())
